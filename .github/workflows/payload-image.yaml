@@ -12,7 +12,8 @@
 # so a build that cannot prove its own layout must not be published.
 #
 # podman is used rather than docker/buildx so that CI runs the same command the
-# README documents. `ADD --checksum` in the Containerfile needs podman >= 4.8.
+# README documents. The Containerfile deliberately avoids `ADD --checksum`, which
+# would need podman 5.0 or BuildKit, so this job has no builder version floor.
 name: payload-image
 
 on:

@@ -50,6 +50,10 @@ rather than one rendered directory.
 podman build -t quay.io/<you>/cluster-api-provider-foo-openshift:v0.1.0 .
 ```
 
+Any builder will do — podman, docker, buildah. The release assets are fetched and
+checksummed in a throwaway stage rather than with `ADD --checksum`, which would have
+imposed a podman 5.0 / BuildKit floor on everyone copying this repository.
+
 To move to a new provider release, bump `PROVIDER_VERSION` and `PROVIDER_DIGEST` and
 re-derive the two asset checksums:
 

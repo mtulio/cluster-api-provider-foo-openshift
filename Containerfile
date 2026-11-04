@@ -66,9 +66,66 @@
 ARG PROVIDER_IMAGE=registry.k8s.io/cluster-api-aws/cluster-api-aws-controller
 ARG PROVIDER_VERSION=v2.13.1
 ARG PROVIDER_DIGEST=sha256:4ac82a803f8913e36d74cd463145d3a6816e9de2fae2ef16ab117e4e31387400
+
+# The throwaway fetcher for stage 2, declared here because only an ARG that
+# precedes the first FROM is global enough to be expanded in a later FROM line.
+ARG FETCH_IMAGE=registry.access.redhat.com/ubi9/ubi-minimal
+ARG FETCH_DIGEST=sha256:dfa0eb04abc59221544e74862432496add1f491f915c9b531880f91affc0e12c
+
 FROM ${PROVIDER_IMAGE}:${PROVIDER_VERSION}@${PROVIDER_DIGEST} AS controller
 
-# --- stage 2: the payload ---------------------------------------------------
+# --- stage 2: the provider's published release assets -----------------------
+#
+# infrastructure-components.yaml and metadata.yaml are published as GitHub
+# release assets of the same tag as the image above. The stable URL form is
+#   https://github.com/<org>/<repo>/releases/download/<tag>/<asset>
+# which redirects to a short-lived, signed objectstore URL. Fetch the stable
+# form and let the redirect happen -- never paste the signed one. It carries a
+# bearer token in its query string, it expires within the hour, and anything
+# that records it (a Containerfile, a log, a commit) records a credential.
+#
+# This runs in a throwaway stage with a shell rather than as `ADD --checksum`
+# in the payload stage, which would be shorter. ADD --checksum needs podman
+# 5.0 or BuildKit, and a reference implementation that only builds on the
+# newest toolchain is not much of a reference: podman 4.9, the version on
+# current Ubuntu and on GitHub's runners, fails it with a misleading
+# "ADD only supports the --chmod and --chown flag". `sha256sum -c` is portable
+# to every builder and states the pin just as plainly.
+#
+# Re-derive both values when bumping PROVIDER_VERSION:
+#
+#   for f in infrastructure-components.yaml metadata.yaml; do
+#     curl -sSL "${PROVIDER_RELEASES}/${PROVIDER_VERSION}/$f" | sha256sum | sed "s|-|$f|"
+#   done
+#
+# These two assets have no upstream checksum file -- CAPA's published
+# checksums.txt covers only the clusterawsadm and clusterctl-aws binaries --
+# so the values below were computed from the downloaded assets and are pinned
+# here as this build's own record of what it expects.
+#
+# The fetcher is pinned by digest too, and is registry.access.redhat.com
+# rather than Docker Hub so that a CI build cannot fail on an anonymous pull
+# rate limit. Nothing from this stage reaches the payload except the two
+# verified files.
+FROM ${FETCH_IMAGE}@${FETCH_DIGEST} AS assets
+
+ARG PROVIDER_VERSION
+ARG PROVIDER_RELEASES=https://github.com/kubernetes-sigs/cluster-api-provider-aws/releases/download
+ARG PROVIDER_COMPONENTS_SHA256=sha256:6fb76f0e60ddccad21c726c755bd24d52d227e4336f2b2a7f285e42090a40db1
+ARG PROVIDER_METADATA_SHA256=sha256:5b8f97c9f03ab0f77621bbbbf8b15383c47c63c42f43a523fe4a1da6bd1b3e3a
+
+WORKDIR /assets
+RUN set -eu; \
+    for f in infrastructure-components.yaml metadata.yaml; do \
+      curl -fsSL --retry 3 --retry-delay 2 \
+        -o "$f" "${PROVIDER_RELEASES}/${PROVIDER_VERSION}/$f"; \
+    done; \
+    printf '%s  %s\n%s  %s\n' \
+      "${PROVIDER_COMPONENTS_SHA256#sha256:}" infrastructure-components.yaml \
+      "${PROVIDER_METADATA_SHA256#sha256:}"   metadata.yaml \
+      | sha256sum -c -
+
+# --- stage 3: the payload ---------------------------------------------------
 #
 # scratch, deliberately. openshift.yaml declares every path the payload
 # contains and the installer rejects an executable the payload did not
@@ -86,27 +143,6 @@ ARG PROVIDER_DIGEST
 # validation does not have to know that this one calls its binary `manager`.
 COPY --from=controller --chmod=0755 /manager /bin/controller
 
-# infrastructure-components.yaml and metadata.yaml are published as GitHub
-# release assets of the same tag as the image above. The stable URL form is
-#   https://github.com/<org>/<repo>/releases/download/<tag>/<asset>
-# which redirects to a short-lived, signed objectstore URL. Fetch the stable
-# form and let the redirect happen -- never paste the signed one. It carries a
-# bearer token in its query string, it expires within the hour, and anything
-# that records it (a Containerfile, a log, a commit) records a credential.
-#
-# `ADD --checksum` is what makes a network fetch acceptable in a payload
-# build: it verifies the SHA-256 before the layer is created and fails the
-# build otherwise. Re-derive both values when bumping PROVIDER_VERSION:
-#
-#   for f in infrastructure-components.yaml metadata.yaml; do
-#     curl -sSL "${PROVIDER_RELEASES}/${PROVIDER_VERSION}/$f" | sha256sum | sed "s|-|$f|"
-#   done
-#
-# These two assets have no upstream checksum file -- CAPA's published
-# checksums.txt covers only the clusterawsadm and clusterctl-aws binaries --
-# so the values below were computed from the downloaded assets and are pinned
-# here as this build's own record of what it expects.
-#
 # Only the CustomResourceDefinitions and webhook configurations in the bundle
 # are ever applied: the installer runs the controller as an OS process, so the
 # Namespace, RBAC, Service, Deployment and cert-manager objects it also
@@ -114,14 +150,8 @@ COPY --from=controller --chmod=0755 /manager /bin/controller
 # The image therefore carries no credential and nothing customer-specific --
 # it is a generic, multi-tenant artifact, which is the requirement for any
 # provider payload.
-ARG PROVIDER_RELEASES=https://github.com/kubernetes-sigs/cluster-api-provider-aws/releases/download
-ARG PROVIDER_COMPONENTS_SHA256=sha256:6fb76f0e60ddccad21c726c755bd24d52d227e4336f2b2a7f285e42090a40db1
-ARG PROVIDER_METADATA_SHA256=sha256:5b8f97c9f03ab0f77621bbbbf8b15383c47c63c42f43a523fe4a1da6bd1b3e3a
-
-ADD --chmod=0644 --checksum=${PROVIDER_COMPONENTS_SHA256} \
-    ${PROVIDER_RELEASES}/${PROVIDER_VERSION}/infrastructure-components.yaml /infrastructure-components.yaml
-ADD --chmod=0644 --checksum=${PROVIDER_METADATA_SHA256} \
-    ${PROVIDER_RELEASES}/${PROVIDER_VERSION}/metadata.yaml /metadata.yaml
+COPY --from=assets --chmod=0644 /assets/infrastructure-components.yaml /infrastructure-components.yaml
+COPY --from=assets --chmod=0644 /assets/metadata.yaml                  /metadata.yaml
 
 # The OpenShift-specific descriptor and clusterctl's own metadata.yaml are a
 # pair: metadata.yaml carries the Cluster API contract, openshift.yaml carries
