@@ -1,0 +1,250 @@
+# Build, verify and publish the provider payload image to GitHub Container Registry.
+#
+# The image is built on every pull request, every push to main and every v* tag.
+# What differs is the tag it is published under:
+#
+#   pull request   PR-<number>        overwritten on every push to that PR
+#   main           main               moving tag for the tip of the branch
+#   v* tag         <tag>, and latest  latest only for a final vX.Y.Z, not a prerelease
+#
+# Every build also runs the "Before you publish" checks from README.md. The payload
+# image is the provider's supported artifact and nothing downstream re-validates it,
+# so a build that cannot prove its own layout must not be published.
+#
+# podman is used rather than docker/buildx so that CI runs the same command the
+# README documents. `ADD --checksum` in the Containerfile needs podman >= 4.8.
+name: payload-image
+
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - 'v*'
+  pull_request:
+
+# A new push to a PR makes the previous build obsolete; stop it rather than racing
+# it to the same PR-<number> tag.
+concurrency:
+  group: payload-image-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  REGISTRY: ghcr.io
+
+jobs:
+  build:
+    name: build and publish
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Resolve image name and tags
+        id: image
+        run: |
+          set -euo pipefail
+
+          # Registry paths must be lowercase; tags may not be.
+          name="${REGISTRY}/$(echo "${GITHUB_REPOSITORY}" | tr '[:upper:]' '[:lower:]')"
+
+          case "${GITHUB_EVENT_NAME}" in
+            pull_request)
+              tags="PR-${PR_NUMBER}"
+              ;;
+            push)
+              if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+                tags="${GITHUB_REF_NAME}"
+                # A prerelease (v1.0.0-rc.1) must not move `latest`.
+                if echo "${GITHUB_REF_NAME}" | grep -qE '^v[0-9]+\.[0-9]+\.[0-9]+$'; then
+                  tags="${tags} latest"
+                fi
+              else
+                tags="main"
+              fi
+              ;;
+            *)
+              echo "unsupported event ${GITHUB_EVENT_NAME}" >&2
+              exit 1
+              ;;
+          esac
+
+          # A pull request from a fork gets a read-only GITHUB_TOKEN, so it is built
+          # and verified but not published. Saying so here beats failing at push.
+          push=true
+          if [ "${GITHUB_EVENT_NAME}" = "pull_request" ] && \
+             [ "${PR_HEAD_REPO}" != "${GITHUB_REPOSITORY}" ]; then
+            push=false
+            echo "::notice::fork pull request - building and verifying only, not publishing"
+          fi
+
+          {
+            echo "name=${name}"
+            echo "tags=${tags}"
+            echo "primary=${name}:$(echo "${tags}" | cut -d' ' -f1)"
+            echo "push=${push}"
+          } >> "${GITHUB_OUTPUT}"
+        env:
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
+
+      - name: Build
+        run: |
+          set -euo pipefail
+          podman --version
+
+          args=()
+          for t in ${TAGS}; do
+            args+=(--tag "${NAME}:${t}")
+          done
+
+          podman build \
+            --label "org.opencontainers.image.revision=${GITHUB_SHA}" \
+            --label "org.opencontainers.image.created=$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            "${args[@]}" \
+            --file Containerfile \
+            .
+        env:
+          NAME: ${{ steps.image.outputs.name }}
+          TAGS: ${{ steps.image.outputs.tags }}
+
+      - name: Verify the payload
+        run: |
+          set -euo pipefail
+          python3 -c 'import yaml' 2>/dev/null || pip install --quiet pyyaml
+
+          root=$(mktemp -d)
+          cid=$(podman create "${IMAGE}")
+          podman export "${cid}" | tar -x -C "${root}"
+          podman rm "${cid}" >/dev/null
+
+          rc=0
+
+          # 1. Every path openshift.yaml declares exists, and the hooks are executable.
+          python3 - "${root}" <<'PY' || rc=1
+          import os, sys, yaml
+          root = sys.argv[1]
+          spec = yaml.safe_load(open(os.path.join(root, "openshift.yaml")))
+          layout = spec["layout"]
+          paths = [("controller", layout["controller"], True),
+                   ("customResource", layout["customResource"], False),
+                   ("clusterTemplates", layout["clusterTemplates"], False),
+                   ("manifestTemplates", layout["manifestTemplates"], False)]
+          paths += [("hooks." + k, v, True) for k, v in layout["hooks"].items()]
+          paths += [("metadata.yaml", "metadata.yaml", False)]
+          bad = False
+          for key, rel, must_exec in paths:
+              full = os.path.join(root, rel)
+              ok = os.path.exists(full)
+              ex = ok and os.access(full, os.X_OK)
+              if not ok or (must_exec and not ex):
+                  bad = True
+              print(f"{key:22} {rel:38} {'OK' if ok else 'MISSING':8} exec={ex}")
+          c = spec["compatibility"]["kubernetes"]
+          print(f"compatibility: kubernetes {c['min']} - {c['max']}")
+          sys.exit(1 if bad else 0)
+          PY
+
+          # 2. Exactly the declared executables and no others. Layout validation
+          #    rejects an executable the descriptor does not name, so an extra one
+          #    is not harmless - it is a payload that fails to install.
+          found=$(cd "${root}" && find . -type f -perm -u+x | sed 's|^\./||' | sort)
+          expected=$(printf '%s\n' bin/controller hooks/infra-ready.sh \
+                       hooks/post-provision.sh hooks/pre-destroy.sh | sort)
+          if [ "${found}" != "${expected}" ]; then
+            echo "::error::executables in the image do not match the declared set"
+            diff <(echo "${expected}") <(echo "${found}") || true
+            rc=1
+          else
+            echo "executables: 4, as declared"
+          fi
+
+          # 3. The installer runs the controller as a host process, not in a
+          #    container, so it cannot rely on this image's libc.
+          if file "${root}/bin/controller" | grep -q 'statically linked'; then
+            echo "controller: statically linked"
+          else
+            echo "::error::bin/controller is not statically linked"
+            file "${root}/bin/controller"
+            rc=1
+          fi
+
+          # 4. No credentials and nothing customer-specific. A provider payload is a
+          #    generic, multi-tenant artifact. Counts only - never print a match.
+          #
+          #    AKIAIOSFODNN7EXAMPLE is AWS's own documentation placeholder and
+          #    appears twice in CAPA's published infrastructure-components.yaml, in
+          #    the AWSClusterStaticIdentity examples. It is inert and allowlisted by
+          #    exact literal - the shape check itself stays in force for everything
+          #    else, including a real key that merely resembles it.
+          allowed='AKIAIOSFODNN7EXAMPLE'
+          for pat in 'BEGIN [A-Z ]*PRIVATE KEY' 'ssh-(rsa|ed25519|dss)' \
+                     'AKIA[0-9A-Z]{16}' 'eyJ[A-Za-z0-9_-]{20,}'; do
+            n=$(grep -rIoE "${pat}" "${root}" 2>/dev/null \
+                  | grep -cvE "${allowed}" || true)
+            echo "secret-shape '${pat}': ${n} match(es)"
+            if [ "${n}" -ne 0 ]; then
+              echo "::error::'${pat}' matched ${n} time(s) in the payload"
+              # Filenames only. The matched text is never printed.
+              grep -rIlE "${pat}" "${root}" | sed "s|^${root}/||"
+              rc=1
+            fi
+          done
+
+          rm -rf "${root}"
+          exit "${rc}"
+        env:
+          IMAGE: ${{ steps.image.outputs.primary }}
+
+      - name: Log in to ${{ env.REGISTRY }}
+        if: steps.image.outputs.push == 'true'
+        run: |
+          printf '%s' "${TOKEN}" \
+            | podman login "${REGISTRY}" --username "${GITHUB_ACTOR}" --password-stdin
+        env:
+          TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Push
+        if: steps.image.outputs.push == 'true'
+        run: |
+          set -euo pipefail
+          for t in ${TAGS}; do
+            podman push "${NAME}:${t}"
+            echo "pushed ${NAME}:${t}"
+          done
+
+          digest=$(podman image inspect "${PRIMARY}" --format '{{ .Digest }}')
+          {
+            echo "## Published"
+            echo
+            for t in ${TAGS}; do echo "- \`${NAME}:${t}\`"; done
+            echo
+            echo "Consume it by digest, not by tag:"
+            echo
+            # Tilde fences, so the backticks that would otherwise sit in a shell
+            # string cannot be read as command substitution by anything parsing
+            # this step. They render identically.
+            printf '~~~yaml\n        image: %s@%s\n~~~\n' "${NAME}" "${digest}"
+          } >> "${GITHUB_STEP_SUMMARY}"
+        env:
+          NAME: ${{ steps.image.outputs.name }}
+          TAGS: ${{ steps.image.outputs.tags }}
+          PRIMARY: ${{ steps.image.outputs.primary }}
+
+      # Re-pushing PR-<number> leaves the previous build behind as an untagged
+      # version, which is what actually accumulates storage. Reclaim it. Best
+      # effort: a package that does not exist yet, or a permission the token does
+      # not carry, must not fail an otherwise good build.
+      - name: Prune untagged versions
+        if: steps.image.outputs.push == 'true'
+        continue-on-error: true
+        uses: actions/delete-package-versions@v5
+        with:
+          package-name: ${{ github.event.repository.name }}
+          package-type: container
+          delete-only-untagged-versions: true
+          min-versions-to-keep: 0
