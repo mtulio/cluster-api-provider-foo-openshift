@@ -155,9 +155,12 @@ not executable — it is sourced, never run.
 The payload image is the provider's supported artifact. Nobody else validates it.
 
 ```sh
-# export the image once; every check below reads the extracted tree
+# export the image once; every check below reads the extracted tree.
+# the command argument is required and never runs — a scratch image has no
+# ENTRYPOINT, and podman 4.x refuses to create a container without one.
 root=$(mktemp -d)
-id=$(podman create <image>); podman export "$id" | tar -x -C "$root"; podman rm "$id"
+id=$(podman create <image> /bin/controller)
+podman export "$id" | tar -x -C "$root"; podman rm "$id"
 
 # 1. the layout the descriptor promises is the layout the image has
 ls -la "$root"

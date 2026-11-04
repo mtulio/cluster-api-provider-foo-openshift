@@ -119,7 +119,11 @@ jobs:
           python3 -c 'import yaml' 2>/dev/null || pip install --quiet pyyaml
 
           root=$(mktemp -d)
-          cid=$(podman create "${IMAGE}")
+          # The command argument is required and never runs. A scratch image has
+          # no ENTRYPOINT or CMD, and podman 4.x refuses to create a container
+          # without one ("no command or entrypoint provided"); podman 5.x allows
+          # it. The container is only ever exported, never started.
+          cid=$(podman create "${IMAGE}" /bin/controller)
           podman export "${cid}" | tar -x -C "${root}"
           podman rm "${cid}" >/dev/null
 
