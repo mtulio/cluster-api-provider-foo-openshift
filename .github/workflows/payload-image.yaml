@@ -133,22 +133,52 @@ jobs:
           python3 - "${root}" <<'PY' || rc=1
           import os, sys, yaml
           root = sys.argv[1]
-          spec = yaml.safe_load(open(os.path.join(root, "openshift.yaml")))
-          layout = spec["layout"]
-          paths = [("controller", layout["controller"], True),
-                   ("customResource", layout["customResource"], False),
-                   ("clusterTemplates", layout["clusterTemplates"], False),
-                   ("manifestTemplates", layout["manifestTemplates"], False)]
-          paths += [("hooks." + k, v, True) for k, v in layout["hooks"].items()]
-          paths += [("metadata.yaml", "metadata.yaml", False)]
+          doc = yaml.safe_load(open(os.path.join(root, "openshift.yaml")))
           bad = False
+
+          if doc.get("kind") != "ExternalProviderPayload":
+              print(f"kind: {doc.get('kind')!r}, expected ExternalProviderPayload")
+              bad = True
+          # Must equal platform.external.platformName; the installer refuses the
+          # install if they differ, so an empty one is a payload nobody can use.
+          if not doc.get("metadata", {}).get("name"):
+              print("metadata.name: missing")
+              bad = True
+
+          spec = doc["spec"]
+          capi, ocp = spec["capi"], spec["openshift"]
+          paths = [("capi.controller", capi["controller"], True),
+                   ("capi.infrastructureComponents", capi["infrastructureComponents"], False),
+                   ("capi.clusterTemplates", capi["clusterTemplates"], False),
+                   ("openshift.manifestTemplates", ocp["manifestTemplates"], False)]
+          if "e2e" in capi:
+              paths += [("capi.e2e.program", capi["e2e"]["program"], True)]
+          paths += [("openshift.installerHooks." + k, v["program"], True)
+                    for k, v in ocp["installerHooks"].items()]
+          paths += [("metadata.yaml", "metadata.yaml", False)]
           for key, rel, must_exec in paths:
               full = os.path.join(root, rel)
               ok = os.path.exists(full)
               ex = ok and os.access(full, os.X_OK)
               if not ok or (must_exec and not ex):
                   bad = True
-              print(f"{key:22} {rel:38} {'OK' if ok else 'MISSING':8} exec={ex}")
+              print(f"{key:36} {rel:38} {'OK' if ok else 'MISSING':8} exec={ex}")
+
+          # The payload owns the whole command line, so these are the payload's
+          # to get right. The installer renders both tokens and rejects a
+          # payload that omits one or repeats it; --kubeconfig it appends
+          # itself, so declaring it is an error too.
+          args = capi["controllerArgs"]
+          for token in ("{{.WebhookPort}}", "{{.WebhookCertDir}}"):
+              n = sum(a.count(token) for a in args)
+              if n != 1:
+                  print(f"controllerArgs: {token} appears {n} times, expected 1")
+                  bad = True
+          if any(a.split("=", 1)[0] == "--kubeconfig" for a in args):
+              print("controllerArgs: --kubeconfig is appended by the installer")
+              bad = True
+          print(f"controllerArgs: {len(args)} args, render tokens OK")
+
           c = spec["compatibility"]["kubernetes"]
           print(f"compatibility: kubernetes {c['min']} - {c['max']}")
           sys.exit(1 if bad else 0)

@@ -22,20 +22,28 @@ feature gate and no Foo entry in any installer table. That is the point of the m
 
 ## The repository root is the payload root
 
-`openshift.yaml` declares a layout, and every path it declares is a file or directory in
-this repository. The installer extracts the image into `capiInstallerPath` (default
+`openshift.yaml` declares a layout under `spec`, and every path it declares is a file or
+directory in this repository. The installer extracts the image into `capiInstallerPath` (default
 `<install-dir>/capi-installer`) and validates that layout before it makes a single cloud
 call.
 
 | Path | `openshift.yaml` key | Where it comes from | Reaches the cluster? |
 | --- | --- | --- | --- |
-| `bin/controller` | `layout.controller` | copied from the provider's released controller image at build time | no — runs as a local installer process |
-| `infrastructure-components.yaml` | `layout.customResource` | the provider's release assets at build time | no — only its CRDs and webhooks are applied, to the local control plane |
+| `bin/controller` | `spec.capi.controller` | copied from the provider's released controller image at build time | no — runs as a local installer process |
+| `infrastructure-components.yaml` | `spec.capi.infrastructureComponents` | the provider's release assets at build time | no — only its CRDs and webhooks are applied, to the local control plane |
 | `metadata.yaml` | — | the provider's release assets at build time | no |
 | `openshift.yaml` | — | this repository | no |
-| `cluster-api/` | `layout.clusterTemplates` | this repository | **no** — applied to the installer's ephemeral control plane |
-| `manifests/` | `layout.manifestTemplates` | this repository | **yes** — folded into `<install-dir>/manifests/` |
-| `hooks/` | `layout.hooks.*` | this repository | no — run on the installer host |
+| `cluster-api/` | `spec.capi.clusterTemplates` | this repository | **no** — applied to the installer's ephemeral control plane |
+| `manifests/` | `spec.openshift.manifestTemplates` | this repository | **yes** — folded into `<install-dir>/manifests/` |
+| `hooks/` | `spec.openshift.installerHooks.<phase>.program` | this repository | no — run on the installer host |
+
+One key in `spec.capi` declares no path: `controllerArgs` is the controller's **whole**
+command line, which the payload owns rather than contributes to. The installer renders
+`{{.WebhookPort}}`, `{{.WebhookCertDir}}` and `{{suggestHealthHostPort}}` into it and
+appends `--kubeconfig`; everything else, including CAPA's
+`--feature-gates=BootstrapFormatIgnition=true`, is the provider's to declare. A cluster
+creator who needs one more flag adds it with `clusterAPI.controllerExtraArgs`, which is
+appended after this list.
 
 The three build-time files are not committed. They are fetched by the `Containerfile`,
 pinned by digest and SHA-256, and a build that cannot reproduce those digests fails.
@@ -87,10 +95,7 @@ platform:
     platformName: foo
     cloudControllerManager: External
     clusterAPI:
-      name: foo
-      controller:
-        sourceType: image
-        image: quay.io/<you>/cluster-api-provider-foo-openshift@sha256:<digest>
+      payloadImage: quay.io/<you>/cluster-api-provider-foo-openshift@sha256:<digest>
       variables:
         AWS_REGION: us-east-1
         AWS_AZ: us-east-1a
@@ -99,7 +104,8 @@ platform:
 ```
 
 A conforming payload needs no path configuration at all — every path defaults beneath
-`capiInstallerPath`, and `openshift.yaml` supplies the rest.
+`capiInstallerPath`, and `openshift.yaml` supplies the rest. `platformName` must equal the
+payload's `metadata.name`; the install is refused if the two differ.
 
 Compute replicas must be `0`: on `platform: external` the installer creates no MachineSets,
 and the worker Machines in `cluster-api/machines/` are what bring the nodes up.
@@ -143,6 +149,12 @@ A payload hook has nowhere to carry command-line arguments, so each script must 
 its defaults and from the installer's environment alone. `post-provision.sh` is written
 that way: it defaults to `openshift-ingress/router-external-default` and recovers the
 hosted zone from the state `infra-ready.sh` recorded.
+
+There is a fourth phase, `ignition`, and this payload deliberately does not declare
+it. It exists for a provider whose controller cannot stage an oversized bootstrap ignition
+itself; CAPA offloads natively to `AWSCluster.spec.s3Bucket`, so Foo needs none. Declaring
+it would additionally require `clusterAPI.bootstrapIgnitionStaging` in the
+`install-config.yaml` above.
 
 All three phases could equally be served by one script dispatching on
 `OPENSHIFT_INSTALL_HOOK`. Whatever you choose, **declare every executable**: layout

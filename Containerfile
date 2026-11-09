@@ -16,10 +16,7 @@
 #       platformName: foo
 #       cloudControllerManager: External
 #       clusterAPI:
-#         name: foo
-#         controller:
-#           sourceType: image
-#           image: quay.io/<you>/cluster-api-provider-foo-openshift@sha256:<digest>
+#         payloadImage: quay.io/<you>/cluster-api-provider-foo-openshift@sha256:<digest>
 #
 # The installer pulls this image, extracts it into capiInstallerPath (default
 # <install-dir>/capi-installer), validates the layout declared in
@@ -27,8 +24,9 @@
 # local process against its own ephemeral Cluster API control plane.
 #
 # This repository's root *is* the payload root, one file or directory per
-# layout key in openshift.yaml. Nothing is copied with `COPY . /`: each path
-# is named explicitly below, so repository furniture -- README.md, .git,
+# path openshift.yaml declares under spec. Nothing is copied with
+# `COPY . /`: each path is named explicitly below, so repository
+# furniture -- README.md, .git,
 # CI configuration -- stays out of the image. Adding a file to the repository
 # does not add it to the payload.
 #
@@ -138,8 +136,9 @@ ARG PROVIDER_IMAGE
 ARG PROVIDER_VERSION
 ARG PROVIDER_DIGEST
 
-# Renamed on the way in. openshift.yaml declares `controller: bin/controller`,
-# a name that is the same for every provider, so the installer's layout
+# Renamed on the way in. openshift.yaml declares
+# `spec.capi.controller: bin/controller`, a name that is the same for every
+# provider, so the installer's layout
 # validation does not have to know that this one calls its binary `manager`.
 COPY --from=controller --chmod=0755 /manager /bin/controller
 

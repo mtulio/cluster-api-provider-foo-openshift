@@ -4,9 +4,10 @@
 # half is clusterctl's own metadata.yaml, which sits next to this file at the
 # payload root and is fetched verbatim from the provider's release assets by
 # the Containerfile. metadata.yaml answers "which Cluster API contract does this
-# provider release implement"; it says nothing about Kubernetes versions and
-# nothing about where the controller binary or the hooks live, because neither
-# concept exists upstream. That residue is what this file carries.
+# provider release implement"; it says nothing about Kubernetes versions,
+# nothing about where the controller binary or the hooks live, and nothing
+# about the controller's command line, because none of those concepts exist
+# upstream. That residue is what this file carries.
 #
 # Everything here describes structure. The installer validates that the
 # declared layout is present and that the compatibility range admits the
@@ -14,73 +15,148 @@
 # the manifests or the hooks. Correctness of the content is the provider's
 # responsibility, established by their release process.
 apiVersion: external.openshift.io/v1alpha1
-kind: ProviderPayload
+kind: ExternalProviderPayload
 
-# Compared against the Kubernetes version of the release payload being
-# installed. Outside this range the install is refused, before any cloud call.
-#
-# Only 1.36 (OpenShift 5.1) is exercised in CI today. The wider band below
-# illustrates the shape of the contract; it is not a tested claim, and a
-# provider publishing a real payload is asserting something their own release
-# process has verified.
-compatibility:
-  kubernetes:
-    min: "1.33"
-    max: "1.37"
+metadata:
+  # Required, and must equal platform.external.platformName in
+  # install-config.yaml -- the install is refused if the two differ. Binding
+  # them is what makes a payload install attributable: platformName is the
+  # value that reaches Infrastructure.status.platformStatus.external, so the
+  # cluster carries a record of which provider installed it.
+  name: foo
 
-# Paths are relative to capiInstallerPath -- the directory the payload is
-# extracted into, which defaults to <install-dir>/capi-installer. A conforming
-# payload therefore needs no path configuration in install-config.yaml at all.
-#
-# Validation is exhaustive: every declared path must exist, the controller must
-# be executable, and an executable the payload did not declare is rejected. An
-# undeclared helper script is not "extra", it is a payload that fails to
-# install.
-layout:
-  # The same path for every provider, so layout validation does not have to
-  # know that this one calls its binary `manager`. The Containerfile copies it
-  # out of the provider's own released controller image and renames it here.
+  # Optional, informational, never read to decide behaviour. Build provenance
+  # belongs in the image's own OCI labels -- this Containerfile sets
+  # org.opencontainers.image.source and .revision -- and these are the
+  # declarative fallback for a provider that does not. They are written to the
+  # install log, so they must carry no credential.
   #
-  # The binary must be demonstrably the one the installer was handed rather
-  # than one it already embedded. Foo rides on CAPA, which the installer *does*
-  # embed, so the Containerfile ships a different, upstream-released CAPA
-  # version from the one the installer vendors -- the version logged at
-  # controller startup is then proof of which binary ran. A provider the
-  # installer does not embed has no such ambiguity to resolve.
-  controller: bin/controller
+  # Foo rides on upstream CAPA, so the repository and revision below are the
+  # provider's, not this wrapper's. Keep the revision in step with
+  # PROVIDER_VERSION in the Containerfile.
+  labels:
+    capi.provider.repo: https://github.com/kubernetes-sigs/cluster-api-provider-aws
+    capi.provider.revision: v2.13.1
 
-  # A single file, not a directory. Every clusterctl provider already publishes
-  # exactly one infrastructure-components.yaml.
+spec:
+  # Compared against the Kubernetes version this installer binary was built
+  # against. Outside this range the install is refused, before any cloud call.
   #
-  # Only its CustomResourceDefinitions and webhook configurations are applied:
-  # the installer runs the controller as a local OS process, so the Namespace,
-  # RBAC, Deployment and credentials Secret the bundle also contains are never
-  # applied to the local control plane. That is why the provider's own
-  # published bundle can be used unmodified and still carry no credential -- its
-  # ${AWS_B64ENCODED_CREDENTIALS} slot is inert here, and the controller takes
-  # its credentials from the environment the installer starts it in.
-  customResource: infrastructure-components.yaml
+  # Only 1.36 (OpenShift 5.1) is exercised in CI today. The wider band below
+  # illustrates the shape of the contract; it is not a tested claim, and a
+  # provider publishing a real payload is asserting something their own release
+  # process has verified.
+  compatibility:
+    kubernetes:
+      min: "1.33"
+      max: "1.37"
 
-  # Cluster API objects -- Cluster, AWSCluster, Machine, AWSMachine -- applied
-  # to the installer's local, ephemeral Cluster API control plane. Nothing in
-  # this tree reaches the installed cluster.
-  clusterTemplates: cluster-api/
-
-  # Day-0 manifests folded into <install-dir>/manifests/ and applied by
-  # bootstrap. These do reach the installed cluster. A different destination
-  # and a different lifetime from clusterTemplates above, which is why the two
-  # are separate keys rather than one rendered directory.
-  manifestTemplates: manifests/
-
-  # One script serves all three phases, dispatching on the
-  # OPENSHIFT_INSTALL_HOOK environment variable the installer sets. It is
-  # declared three times rather than left as an undeclared helper because an
-  # executable the payload did not declare is rejected.
+  # Everything Cluster API needs to run this provider. Paths are relative to
+  # capiInstallerPath -- the directory the payload is extracted into, which
+  # defaults to <install-dir>/capi-installer. A conforming payload therefore
+  # needs no path configuration in install-config.yaml at all.
   #
-  # Hooks are copied verbatim, never rendered. This script expands
-  # ${OPENSHIFT_INSTALL_INFRA_ID}, ${REGION} and others as *shell* variables at
-  # run time; substituting them at render time would destroy it.
-  hooks:
-    infraReady: hooks/infra-ready.sh
-    postProvision: hooks/post-provision.sh
-    preDestroy: hooks/pre-destroy.sh
+  # Validation is exhaustive: every declared path must exist, the controller
+  # must be executable, and an executable the payload did not declare is
+  # rejected. An undeclared helper script is not "extra", it is a payload that
+  # fails to install.
+  capi:
+    # The same path for every provider, so layout validation does not have to
+    # know that this one calls its binary `manager`. The Containerfile copies
+    # it out of the provider's own released controller image and renames it
+    # here.
+    #
+    # The binary must be demonstrably the one the installer was handed rather
+    # than one it already embedded. Foo rides on CAPA, which the installer
+    # *does* embed, so the Containerfile ships a different, upstream-released
+    # CAPA version from the one the installer vendors -- the version logged at
+    # controller startup is then proof of which binary ran. A provider the
+    # installer does not embed has no such ambiguity to resolve.
+    controller: bin/controller
+
+    # The controller's whole command line, not an addition to one. The pilot
+    # injected a fixed list from inside the installer and appended the
+    # provider's; append cannot remove, so a provider whose flag names differ
+    # had no way to correct them and needed a wrapper script. The payload now
+    # owns the list outright, which is what every integrated provider already
+    # does.
+    #
+    # The {{...}} tokens are rendered by the installer before exec, which is
+    # how a payload declares a flag whose value only the installer knows.
+    # {{.WebhookPort}} and {{.WebhookCertDir}} are each required exactly once;
+    # {{suggestHealthHostPort}} is optional, and omitting it means the
+    # installer does not poll /healthz. --kubeconfig is appended by the
+    # installer and must not be declared here.
+    #
+    # The list below is byte-for-byte the one the installer injects for its own
+    # integrated AWS provider, which is deliberate: this payload is the
+    # control for the mechanism, so it must not also change the controller's
+    # behaviour. BootstrapFormatIgnition is the gate CAPA requires before it
+    # will accept AWSMachine.spec.ignition at all -- provider knowledge, which
+    # is why it belongs here and not in the cluster creator's install-config.
+    controllerArgs:
+    - -v=4
+    - --diagnostics-address=0
+    - --health-addr={{suggestHealthHostPort}}
+    - --webhook-port={{.WebhookPort}}
+    - --webhook-cert-dir={{.WebhookCertDir}}
+    - --feature-gates=BootstrapFormatIgnition=true,ExternalResourceGC=true,TagUnmanagedNetworkResources=false,EKS=false,MachinePool=false
+
+    # A single file, not a directory. Every clusterctl provider already
+    # publishes exactly one infrastructure-components.yaml.
+    #
+    # Only its CustomResourceDefinitions and webhook configurations are
+    # applied: the installer runs the controller as a local OS process, so the
+    # Namespace, RBAC, Deployment and credentials Secret the bundle also
+    # contains are never applied to the local control plane. That is why the
+    # provider's own published bundle can be used unmodified and still carry no
+    # credential -- its ${AWS_B64ENCODED_CREDENTIALS} slot is inert here, and
+    # the controller takes its credentials from the environment the installer
+    # starts it in.
+    infrastructureComponents: infrastructure-components.yaml
+
+    # Cluster API objects -- Cluster, AWSCluster, Machine, AWSMachine -- applied
+    # to the installer's local, ephemeral Cluster API control plane. Nothing in
+    # this tree reaches the installed cluster.
+    clusterTemplates: cluster-api/
+
+    # spec.capi.e2e is deliberately absent. It is reserved in the API for a
+    # payload to declare its own test entry point, but every declared path must
+    # exist and this payload ships no bin/e2e -- declaring one it does not have
+    # would fail layout validation. Nothing in the install depends on it.
+
+  # What the OpenShift installer does beyond Cluster API. A consumer that is not
+  # the installer reads manifestTemplates and ignores installerHooks, which is
+  # why the hooks carry the consumer in their name.
+  openshift:
+    # Day-0 manifests folded into <install-dir>/manifests/ and applied by
+    # bootstrap. These do reach the installed cluster. A different destination
+    # and a different lifetime from capi.clusterTemplates above, which is why
+    # the two are separate keys rather than one rendered directory.
+    manifestTemplates: manifests/
+
+    # One script may serve every phase, dispatching on the
+    # OPENSHIFT_INSTALL_HOOK environment variable the installer sets. This
+    # payload uses three, and declares each one: an executable the payload did
+    # not declare is rejected, which is also why hooks/lib/common.sh is not
+    # executable -- it is sourced, never run.
+    #
+    # Hooks are copied verbatim, never rendered. These scripts expand
+    # ${OPENSHIFT_INSTALL_INFRA_ID}, ${REGION} and others as *shell* variables
+    # at run time; substituting them at render time would destroy them.
+    #
+    # Paths are literal, so the .sh suffix these scripts carry is declared.
+    #
+    # No ignition hook. That hook exists for a provider whose controller cannot
+    # stage an oversized bootstrap ignition itself; CAPA offloads natively to
+    # AWSCluster.spec.s3Bucket, so this payload needs none, and declaring one
+    # would additionally require
+    # platform.external.clusterAPI.bootstrapIgnitionStaging in
+    # install-config.yaml.
+    installerHooks:
+      infraReady:
+        program: hooks/infra-ready.sh
+      postProvision:
+        program: hooks/post-provision.sh
+      preDestroy:
+        program: hooks/pre-destroy.sh
