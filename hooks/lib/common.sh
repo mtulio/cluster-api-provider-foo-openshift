@@ -103,13 +103,53 @@
 #                                     usable by none until the cluster's API
 #                                     is serving, which at infra-ready it is
 #                                     not and at post-provision it is
+#   OPENSHIFT_INSTALL_HOOK_FAILURE_   a path this hook MAY write one line to,
+#   FILE                              which the installer then quotes in the
+#                                     error it reports. Optional in both
+#                                     directions: unset by an older installer,
+#                                     unwritten by a hook with nothing to add.
+#                                     See die() for why the installer asks for
+#                                     one chosen line instead of reading the
+#                                     log itself
 #
-# Arguments are the other half, and are the partner's own: the installer
-# passes them through verbatim from
-# platform.external.clusterAPI.hooks.<hook>.args and does not read them. Only
-# post-provision takes any; the other two reject arguments rather than
-# ignoring them, so a flag attached to the wrong phase is an error and not a
-# silent no-op.
+# The installer passes no arguments. There used to be a
+# platform.external.clusterAPI.hooks.<hook>.args field and this file used to
+# describe it; the field is gone, and a hook is now fully described by its
+# program path. The flags post-provision still parses are for re-running it by
+# hand from a line copied out of the installer log -- the installer itself
+# invokes every hook with an empty argv. The other two phases reject arguments
+# rather than ignoring them, so a flag attached to the wrong phase is an error
+# and not a silent no-op.
+#
+#
+# CREDENTIALS ARE THE PROVIDER'S, AND THIS IS THE WHOLE OF WHAT IS SUPPORTED
+#
+# The installer creates no cloud identity on this platform. It does not create
+# an IAM role, an instance profile, or the `aws-cloud-credentials` Secret the
+# cloud controller manager mounts -- pkg/asset/manifests/openshift.go emits
+# that Secret only for the integrated platforms, and `external` is not one of
+# them, so nothing in OpenShift will ever create it here. Whatever the cloud
+# needs to be talked to is the provider's to deliver and the provider's to keep
+# working. That is the contract, and this payload is one way to satisfy it:
+# post-provision.sh materializes the Secret from the installer's own
+# credentials.
+#
+# AWS_SHARED_CREDENTIALS_FILE is the only variable this reference
+# implementation reads, and the only one it supports. It is read because it is
+# what the installer and the CAPA controller are already configured with: the
+# installer's whole environment is inherited by both -- for the controller at
+# pkg/clusterapi/internal/process/process.go:131, for a hook at
+# pkg/infrastructure/external/hooks/hooks.go:217 -- so a payload that reads it
+# is using the same credentials that built the infrastructure, by construction,
+# with nothing to keep in sync.
+#
+# It is deliberately the only one. AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY,
+# AWS_PROFILE, AWS_ROLE_ARN with web identity, IMDS and an instance profile,
+# container credentials -- the SDK supports all of them and this payload
+# supports none of them. That is not an oversight and it is not a gap for
+# OpenShift to close. An integrator whose environment uses one of them extends
+# this script, and having extended it, owns it: the installer has no opinion on
+# how the credential was obtained and will not grow one.
 #
 # Two of the environment entries deserve comment.
 #
@@ -132,7 +172,27 @@
 # this file is sourced -- so that sourcing it is strict too.
 
 log() { printf '%s %s\n' "[$(date -u +%H:%M:%S)] external-hook:" "$*" >&2; }
-die() { log "ERROR: $*"; exit 1; }
+
+# die ends the hook, and gives the installer this hook's own words for its
+# error rather than only a path to a log the reader has to go and open.
+#
+# OPENSHIFT_INSTALL_HOOK_FAILURE_FILE is how that is offered. Writing it is
+# optional and its content is the hook author's choice, and that is the whole
+# design: the installer cannot simply quote a hook's last output, because the
+# ignition phase's natural output is a pre-signed URL over the entire bootstrap
+# ignition -- every day-0 secret. One line the author picked deliberately is
+# safe in a way `tail -1` can never be.
+#
+# Best-effort. A hook whose failure file cannot be written still fails for the
+# original reason, and that reason is still in this log; losing the summary
+# must not become a second, confusing error on top of the first.
+die() {
+	log "ERROR: $*"
+	if [[ -n ${OPENSHIFT_INSTALL_HOOK_FAILURE_FILE:-} ]]; then
+		printf '%s\n' "$*" >"${OPENSHIFT_INSTALL_HOOK_FAILURE_FILE}" 2>/dev/null || true
+	fi
+	exit 1
+}
 
 # ---------------------------------------------------------------- contract
 

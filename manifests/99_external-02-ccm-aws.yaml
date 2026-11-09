@@ -112,10 +112,13 @@ spec:
           --leader-elect-resource-namespace=openshift-cloud-controller-manager \
           -v=2
         env:
-        # The AWS SDK reads this path if the file exists and falls back to
-        # the instance metadata service if it does not, so this line is
-        # correct both for this pilot (no IAM, credentials in a Secret) and
-        # for a partner using an instance profile.
+        # Pointing at the mount below. The AWS SDK reads this path if the file
+        # exists and falls back through the rest of its credential chain to
+        # the instance metadata service if it does not, so the line is correct
+        # for a partner using an instance profile as well -- but note that the
+        # fallback is silent, and what it reports when it reaches the end is a
+        # 404 from IMDS, which reads like a missing instance profile and is
+        # not. If this file is absent the real fault is upstream of the SDK.
         - name: AWS_SHARED_CREDENTIALS_FILE
           value: /etc/aws/credentials
         ports:
@@ -178,6 +181,34 @@ spec:
           items:
           - key: ca-bundle.crt
             path: tls-ca-bundle.pem
+      # Created by ../hooks/post-provision.sh from the installer's own
+      # AWS_SHARED_CREDENTIALS_FILE, not by anything in OpenShift and not by
+      # this payload. The installer emits a cloud-credentials Secret only for
+      # the integrated platforms (pkg/asset/manifests/openshift.go) and
+      # `external` is not one of them; the cloud credential operator needs
+      # that same root Secret and a platform-matched CredentialsRequest and
+      # has neither here. On this platform the credential is the provider's to
+      # deliver, which is what the hook is for.
+      #
+      # `optional: true` is load-bearing. This Deployment is a day-0 manifest
+      # and the hook runs well after the control plane is up, so the pod is
+      # always created before the Secret exists. Optional lets it start, fail
+      # to authenticate and crash-loop; the default would leave it in
+      # ContainerCreating instead. Do not "fix" this to false.
+      #
+      # But optional is not self-healing, and that is the part worth knowing.
+      # Measured on a pilot cluster 2026-11-09: with the Secret created while
+      # two pods were already crash-looping, a pod that was REPLACED came up
+      # Running on its first attempt, and a pod that was merely left alone was
+      # still crash-looping seven minutes later. A volume that was empty when
+      # the pod started does not reliably become populated underneath a
+      # container that keeps restarting within it.
+      #
+      # So the hook deletes these pods after applying the Secret, and that
+      # delete is not an optimisation -- it is what makes the credential take
+      # effect. Within ninety seconds of the replacement both replicas were
+      # Running, the uninitialized taint was gone from all three masters and
+      # the nodes were Ready.
       - name: cloud-credentials
         secret:
           secretName: aws-cloud-credentials
