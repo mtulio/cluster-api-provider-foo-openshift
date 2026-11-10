@@ -102,6 +102,27 @@ spec:
     - --webhook-cert-dir={{.WebhookCertDir}}
     - --feature-gates=BootstrapFormatIgnition=true,ExternalResourceGC=true,TagUnmanagedNetworkResources=false,EKS=false,MachinePool=false
 
+    # The environment this payload cannot start without.
+    #
+    # Checked by the installer before the local control plane starts and
+    # before any cloud resource exists, so a missing name costs seconds and
+    # names itself. Without it the failure is a start-up timeout, or -- worse
+    # here -- an install that provisions infrastructure and only falls over
+    # later, in post-provision, when the hook has no credential to build the
+    # cloud controller manager's Secret from.
+    #
+    # ONE NAME, AND ONLY ONE, BECAUSE THIS IS A REFERENCE IMPLEMENTATION.
+    # AWS_SHARED_CREDENTIALS_FILE is the whole of what this payload supports:
+    # not AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY, not AWS_PROFILE, not
+    # AWS_ROLE_ARN, not instance or container credentials. An integrator who
+    # needs those extends this and owns the result. See hooks/lib/common.sh.
+    #
+    # AWS_REGION is deliberately absent: common.sh falls back through
+    # AWS_DEFAULT_REGION to us-east-1, so it is configuration rather than a
+    # precondition, and declaring it would fail installs that work today.
+    requiredEnv:
+    - AWS_SHARED_CREDENTIALS_FILE
+
     # A single file, not a directory. Every clusterctl provider already
     # publishes exactly one infrastructure-components.yaml.
     #
